@@ -1,84 +1,121 @@
+#include <cublas_v2.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <stdio.h>
+#include <stdlib.h>
 
-#define MAXBLOCKSIZE 1024
+#include "coalesced_warp_2.cuh"
+#include "coalesced_warpblock_3.cuh"
+#include "cublas_0.cuh"
+#include "naive_1.cuh"
+#include "utils.cuh"
+#include "vectorized_4.cuh"
 
-void displayMat(int *A, int M, int N){
-    for(int i = 0; i < M; i++){
-        for(int j = 0; j < N; j++){
-            printf("%d\t", A[i * N + j]);
+/*
+Benchmarks a kernel against cuBLAS for different sizes
+*/
+void benchmark_kernel_for_sizes(int minM, int maxM, float THEORETICAL_MAX_GFLOPS, float THEORETICAL_MAX_MEMORY_BANDWIDTH) {
+    FILE *gflops_file = fopen("benchmarks/kernel_4_vs_cublas-gflops.txt", "w");
+    FILE *memory_file = fopen("benchmarks/kernel_4_vs_cublas-memory.txt", "w");
+
+    if (gflops_file == NULL) {
+        perror("Error opening the file for GFLOPS.\n");
+    }
+    if (memory_file == NULL) {
+        perror("Error opening the file for Memory Bandwidth.\n");
+    }
+
+    for (int M = minM; M <= maxM; M *= 2) {
+        int N = 2 * M;  // matrix size (M, N)
+
+        printf("------------ Running benchmark for M = %d ---------------\n", M);
+
+        size_t matsize = M * N;  // (M, N)
+        size_t vecsize = N;      // (N, 1)
+        size_t mat_totalsize = matsize * sizeof(float);
+        size_t vec_totalsize = vecsize * sizeof(float);
+
+        // allocate host
+        float *mat = (float *)malloc(mat_totalsize);
+        float *vec = (float *)malloc(vec_totalsize);
+        float *res = (float *)malloc(M * sizeof(float));
+
+        for (size_t i = 0; i < matsize; i++) {
+            mat[i] = random_normal_clamped(-10.f, 10.f);
+            // hacky way to init the vector as well
+            if (i < vecsize) {
+                vec[i] = random_normal_clamped(-10.f, 10.f);
+            }
         }
-        printf("\n");
-    }
-    printf("\n");
-}
 
-void displayVec(int *A, int N){
-    for(int i = 0; i < N; i++){
-        printf("%d\t", A[i]);
-    }
-    printf("\n");
-}
+        cudaEvent_t start, stop;
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&stop));
+        float ms = 0.0f;
 
-__global__ void sgemv_v1(int  *A, int *x, int *y, int M, int N){
-    unsigned row = blockDim.x * blockIdx.x + threadIdx.x;
+        // allocate device
+        float *matd, *vecd, *resd;
+        cudaEventRecord(start);
+        CUDA_CHECK(cudaMalloc((void **)&matd, mat_totalsize));
+        CUDA_CHECK(cudaMalloc((void **)&vecd, vec_totalsize));
+        CUDA_CHECK(cudaMalloc((void **)&resd, M * sizeof(float)));
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&ms, start, stop);
+        printf(">> GPU allocation time: %f ms\n", ms);
 
-    if (row < M) {
-        float sum = 0.0f;
-        for (unsigned col = 0; col < N; col++) {
-            sum += A[row * N + col] * x[col];
-        }
-        y[row] = sum;
+        // copy host to device
+        cudaEventRecord(start);
+        CUDA_CHECK(cudaMemcpy(matd, mat, mat_totalsize, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(vecd, vec, vec_totalsize, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(resd, res, M * sizeof(float), cudaMemcpyHostToDevice));
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&ms, start, stop);
+        printf(">> Host to device transfer time: %f ms\n", ms);
+
+        // run cuBLAS kernel and write results to file
+        float mscub = run_kernel_cublas_sgemv(matd, vecd, resd, M, N, THEORETICAL_MAX_GFLOPS, THEORETICAL_MAX_MEMORY_BANDWIDTH);
+        float gflopscub = compute_gflops(M, N, mscub);
+        float mem_bandcub = compute_peak_memory_bandwidth(M, N, mscub, THEORETICAL_MAX_MEMORY_BANDWIDTH);
+
+        // run custom kernel and write results to file
+        ms = run_kernel_vectorized_sgmev(matd, vecd, resd, M, N, THEORETICAL_MAX_GFLOPS, THEORETICAL_MAX_MEMORY_BANDWIDTH);
+        float gflops = compute_gflops(M, N, ms);
+        float mem_band = compute_peak_memory_bandwidth(M, N, ms, THEORETICAL_MAX_MEMORY_BANDWIDTH);
+
+        fprintf(gflops_file, "%d %f %f\n", M, gflops, gflopscub);
+        fprintf(memory_file, "%d %f %f\n", M, mem_band, mem_bandcub);
+
+        // copy device to host
+        cudaEventRecord(start);
+        CUDA_CHECK(cudaMemcpy(res, resd, M * sizeof(float), cudaMemcpyDeviceToHost));
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&ms, start, stop);
+        printf(">> Device to host transfer time: %f ms\n", ms);
+
+        // cleanup
+        cudaFree(matd);
+        cudaFree(vecd);
+        cudaFree(resd);
+        free(mat);
+        free(vec);
+        free(res);
     }
+
+    fclose(gflops_file);
+    fclose(memory_file);
 }
 
 int main() {
-    unsigned m = 5, n = 7;
-    int *cpu_a, *cpu_x, *cpu_y;
-    int *gpu_a, *gpu_x, *gpu_y;
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+    int cudaCores = prop.multiProcessorCount * 128;
+    float clockGHz = prop.clockRate / 1e6;
 
-    // allocate memory to cpu variables
-    cpu_a = (int*) malloc(sizeof(int)*m*n);
-    cpu_x = (int*) malloc(sizeof(int)*n);
-    cpu_y = (int*) malloc(sizeof(int)*n);
+    float THEORETICAL_MAX_GFLOPS = cudaCores * clockGHz * 2;
+    float THEORETICAL_MAX_MEMORY_BANDWIDTH = (2 * prop.memoryClockRate * prop.memoryBusWidth) / (8.0 * 1e6);
 
-    // allocate memory to gpu variables
-    cudaMalloc(&gpu_a, sizeof(int)*m*n);
-    cudaMalloc(&gpu_x, sizeof(int)*n);
-    cudaMalloc(&gpu_y, sizeof(int)*n);
-
-    // populate cpu_a
-    for(int i = 0; i < m; i++){
-        for(int j = 0; j < n; j++){
-            // cpu_a[i * n + j] = rand() % (m * n + 1);
-            cpu_a[i * n + j] = i + j;
-        }
-    }
-
-    // populate cpu_x
-    for(int i = 0; i < n; i++){
-        // cpu_x[i] = rand() % (m * n + 1);
-        cpu_x[i] = i;
-    }
-
-    displayMat(cpu_a, m, n);
-    displayVec(cpu_x, n);
-
-    // copy data to gpu
-    cudaMemcpy(gpu_a, cpu_a, sizeof(int)*m*n, cudaMemcpyHostToDevice);
-    cudaMemcpy(gpu_x, cpu_x, sizeof(int)*n, cudaMemcpyHostToDevice);
-
-    // call kernel
-    unsigned nBlocks = ceil((float)(m * n + MAXBLOCKSIZE - 1) / MAXBLOCKSIZE);
-    sgemv_v1<<<nBlocks, MAXBLOCKSIZE>>>(gpu_a, gpu_x, gpu_y, m, n);
-
-    // copy result
-    cudaMemcpy(cpu_y, gpu_y, sizeof(int)*n, cudaMemcpyDeviceToHost);
-
-    // print result
-    displayVec(cpu_y, n);
-    printf("\n");
-
-    return 0;
+    benchmark_kernel_for_sizes(4096, 4096, THEORETICAL_MAX_GFLOPS, THEORETICAL_MAX_MEMORY_BANDWIDTH);
 }
