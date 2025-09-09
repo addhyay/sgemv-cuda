@@ -3,7 +3,7 @@
 #include <cuda_runtime.h>
 #include <stdio.h>
 
-#include "utils.cuh"
+#include "../include/utils.cuh"
 
 /*
 Naive Sgemv kernel

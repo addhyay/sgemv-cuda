@@ -1,6 +1,6 @@
 #include <stdio.h>
 
-#include "utils.cuh"
+#include "../include/utils.cuh"
 
 /*
 Helper function to generate a clamped random number sampled from a
